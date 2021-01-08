@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "tracy/TracyC.h"
 #include "tracy/Tracy.hpp"
+#include <cuda.h>
 
 #define w 600
 #define h 800
@@ -62,11 +63,14 @@ int main() {
             for (int y1 = 0; y1 < h; y1++) {
                 ZoneScopedN("Y LOOP")
                 points[x1][y1] = 0;
+                std::mutex point;
                 for (int x2 = 0; x2 < w; x2++) {
                     for (int y2 = 0; y2 < h; y2++) {
+                        point.lock();
                         points[x1][y1] += getCurrentValue(20, sources[x2][y2].λ, 0, 0, 299792458,
                                                           glm::distance(sources[x2][y2].location, vec3{x1, y1, 100}) /
                                                           299792458);
+                        point.unlock();
                     }
 
                 }
