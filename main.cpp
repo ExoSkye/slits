@@ -1,47 +1,76 @@
-#include <cmath>
 #include <SDL2/SDL.h>
-#include <glm/glm.hpp>
-#include <vector>
-#include <algorithm>
-#include <cstdio>
-#include "tracy/TracyC.h"
-#include "tracy/Tracy.hpp"
 #include <cuda.h>
+#include <cmath>
+#include "tracy/Tracy.hpp"
 
-#define w 600
-#define h 800
-
-long double getCurrentValue(long double A, long double λ, long double ϕ, long double x, long double v, long double t) {
-    long double ret = A*std::sin(((2*M_PIl)/λ)*(x+v*t)+ϕ);
-    return ret;
+#define w 800
+#define h 600
+#define windowwidth 800
+#define windowheight 600
+__device__ void getCurrentValue(float* out, float λ, float dist) {
+    float ret = 20*sin((2*M_PI)/λ*299792458*(dist/299792458));
+    //printf("ret %f dist %f\n",ret,dist);
+    *out = ret;
 }
 
-typedef glm::vec<2,long double,glm::defaultp> vec2;
-typedef glm::vec<3,long double,glm::defaultp> vec3;
 
 struct wavesource {
-    vec3 location;
-    long double λ;
-    long double A;
+    float x;
+    float y;
+    float z;
+    float λ;
 };
 
-int main() {
-    SDL_Window* wnd = SDL_CreateWindow("Test frequency",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,800,600,0);
-    SDL_Renderer* rend = SDL_CreateRenderer(wnd,-1,SDL_RENDERER_ACCELERATED);
+struct point {
+    float x;
+    float y;
+    float z;
+    float value;
+};
 
-    double wave = 650.0*pow(10.0,-9.0);
-
-    std::vector<std::vector<wavesource>> sources;
-
-    for (int x = 0; x < w; x++) {
-        sources.emplace_back(std::vector<wavesource>{});
-        for (int y = 0; y < h; y++) {
-            sources[x].emplace_back(wavesource{vec3{x + 1, y + 1, 1}, 650 * pow(10, -9), 20});
+__global__ void parallelfunc(point* points, wavesource* sources, int max) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < max) {
+        for (int i = 0; i < max; i++) {
+            float out = 0.0;
+            getCurrentValue(&out,sources[idx].λ,sqrt(pow(sources[idx].x-points[i].x,2)+
+                                                      pow(sources[idx].y-points[i].y,2)+
+                                                      pow(sources[idx].z-points[i].z,2)));
+            atomicAdd(&points[i].value,out);
         }
     }
+}
 
-    long double points[w][h];
+int main() {
+    SDL_Window* wnd = SDL_CreateWindow("Test frequency",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,
+                                       windowwidth,windowheight,0);
+    SDL_Renderer* rend = SDL_CreateRenderer(wnd,-1,SDL_RENDERER_ACCELERATED);
 
+    float wave = 650.0*pow(10.0,-9.0);
+
+    wavesource* sources;
+    sources = (wavesource*)malloc(sizeof(wavesource)*w*h);
+
+    point* points;
+    point* origpoints;
+    origpoints = (point*)malloc(sizeof(point)*w*h);
+    points = (point*)malloc(sizeof(point)*w*h);
+
+    for (int i = 0; i < w*h; i++) {
+        sources[i] = wavesource{static_cast<float>(i/w),static_cast<float>(i%h),0,wave};
+        origpoints[i] = point{static_cast<float>(i/w),static_cast<float>(i%h),100,0.0};
+    }
+    wavesource* dsources = nullptr;
+    point* dpoints = nullptr;
+    cudaMalloc((void**)&dsources, sizeof(wavesource)*w*h);
+    cudaMalloc((void**)&dpoints, sizeof(point)*w*h);
+    cudaMemcpy(dsources,sources,sizeof(wavesource)*w*h,cudaMemcpyHostToDevice);
+    cudaMemcpy(dpoints,origpoints,sizeof(point)*w*h,cudaMemcpyHostToDevice);
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (w*h + threadsPerBlock - 1) / threadsPerBlock;
+
+    int width = windowwidth/w;
+    int height = windowheight/h;
     bool running = true;
     while (running) {
         SDL_Event event;
@@ -52,36 +81,39 @@ int main() {
                     break;
             }
         }
-        SDL_SetRenderDrawColor(rend,0,0,0,255);
-        SDL_RenderClear(rend);
-        SDL_SetRenderDrawColor(rend,255,255,255,255);
-        int width = 600/w;
-        int height = 800/h;
-        TracyCZoneN(mainloop,"Main loop",true)
-        for (int x1 = 0; x1 < w; x1++) {
-            ZoneScopedN("X LOOP")
-            for (int y1 = 0; y1 < h; y1++) {
-                ZoneScopedN("Y LOOP")
-                points[x1][y1] = 0;
-                std::mutex point;
-                for (int x2 = 0; x2 < w; x2++) {
-                    for (int y2 = 0; y2 < h; y2++) {
-                        point.lock();
-                        points[x1][y1] += getCurrentValue(20, sources[x2][y2].λ, 0, 0, 299792458,
-                                                          glm::distance(sources[x2][y2].location, vec3{x1, y1, 100}) /
-                                                          299792458);
-                        point.unlock();
-                    }
 
-                }
-                SDL_SetRenderDrawColor(rend, std::min(points[x1][y1], 255.0l), 0, 0, 255);
-                SDL_RenderDrawPoint(rend, x1,y1);
-            }
+        {
+            ZoneScopedN("Kernel running")
+            parallelfunc<<<blocksPerGrid, threadsPerBlock>>>(dpoints, dsources, w * h);
+            cudaDeviceSynchronize();
         }
-        TracyCZoneEnd(mainloop)
+        {
+            ZoneScopedN("Memcpy results")
+            cudaMemcpy(points, dpoints, sizeof(point) * w * h, cudaMemcpyDeviceToHost);
+        }
+        {
+            ZoneScopedN("Reset GPU Memory")
+            cudaMemcpy(dpoints, origpoints, sizeof(point) * w * h, cudaMemcpyHostToDevice);
+        }
+        {
+            ZoneScopedN("Render")
+            for (int i = 0; i < w*h; i++) {
+                point _point = points[i];
+                SDL_SetRenderDrawColor(rend, _point.value, _point.value, _point.value, 255);
+                SDL_Rect rect = {static_cast<int>(_point.x * width),
+                                 static_cast<int>(_point.y * height),
+                                 width,
+                                 height};
+                SDL_RenderDrawRect(rend, &rect);
+                SDL_RenderFillRect(rend, &rect);
+            }
+        FrameMark;
+        }
         SDL_RenderPresent(rend);
         SDL_Delay(16);
     }
+    cudaFree(dpoints);
+    cudaFree(dsources);
     SDL_DestroyRenderer(rend);
     SDL_DestroyWindow(wnd);
     SDL_Quit();

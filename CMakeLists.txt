@@ -11,6 +11,12 @@ target_link_libraries(slits PUBLIC SDL2 dl cuda)
 
 target_compile_definitions(slits PUBLIC TRACY_ENABLE)
 
+option(fastmath "Whether to use cuda fast math or not" OFF)
+
+if(fastmath MATCHES "ON")
+    target_compile_options(slits PUBLIC -use_fast_math)
+    message("Using fast math")
+endif()
 set_target_properties(
         slits
         PROPERTIES
